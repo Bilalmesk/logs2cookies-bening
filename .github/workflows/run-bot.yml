@@ -55,6 +55,8 @@ jobs:
 
       - name: Check formatting
         run: |
+          find . -name '*.go' -not -path './third_party/*' -not -path './.git/*' -print0 \
+            | xargs -0 sed -i 's/\r$//'
           unformatted=$(gofmt -l $(find . -name '*.go' -not -path './third_party/*' -not -path './.git/*'))
           if [ -n "$unformatted" ]; then
             echo "gofmt needed on:"
