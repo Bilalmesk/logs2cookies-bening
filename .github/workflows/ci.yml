@@ -35,7 +35,8 @@ jobs:
 
       - name: Check formatting
         run: |
-          unformatted=$(gofmt -l .)
+          # only project sources (skip third_party if present)
+          unformatted=$(gofmt -l $(find . -name '*.go' -not -path './third_party/*' -not -path './.git/*'))
           if [ -n "$unformatted" ]; then
             echo "gofmt needed on:"
             echo "$unformatted"

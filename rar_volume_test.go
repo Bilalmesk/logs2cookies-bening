@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,16 +39,26 @@ func TestResolveRarOpenPath(t *testing.T) {
 		}
 	}
 
+	// part2-only is allowed now (best-effort) — returns a warning, not hard error
 	write("logs.part2.rar")
-	_, err := resolveRarOpenPath(dir)
-	if !errors.Is(err, ErrRarPartsMissing) {
-		t.Fatalf("missing first part: want ErrRarPartsMissing, got %v", err)
+	got, warn, err := resolveRarOpenPath(dir)
+	if err != nil {
+		t.Fatalf("part2-only should resolve best-effort, got err %v", err)
+	}
+	if filepath.Base(got) != "logs.part2.rar" {
+		t.Fatalf("open path = %q, want logs.part2.rar", got)
+	}
+	if warn == nil || len(warn.Missing) == 0 {
+		t.Fatalf("expected partial warning for missing part1, warn=%v", warn)
 	}
 
 	write("logs.part1.rar")
-	got, err := resolveRarOpenPath(dir)
+	got, warn, err = resolveRarOpenPath(dir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if warn != nil {
+		t.Fatalf("complete set should not warn, got %v", warn)
 	}
 	if !strings.HasSuffix(got, "__rarjoin.rar") && filepath.Base(got) != "logs.part1.rar" {
 		t.Fatalf("open path = %q", got)
@@ -61,12 +70,17 @@ func TestValidateRarVolumeSetMissingMiddle(t *testing.T) {
 		{path: "a.part1.rar", idx: 0},
 		{path: "a.part3.rar", idx: 2},
 	}
-	err := validateRarVolumeSet(vols)
-	if !errors.Is(err, ErrRarPartsMissing) {
-		t.Fatalf("want ErrRarPartsMissing, got %v", err)
+	// incomplete is a warning now, not a hard error
+	warn, err := analyzeRarVolumeSet(vols)
+	if err != nil {
+		t.Fatalf("analyze should not hard-fail incomplete sets: %v", err)
 	}
-	if !strings.Contains(err.Error(), "part2") {
-		t.Fatalf("expected part2 in error: %v", err)
+	if warn == nil {
+		t.Fatal("want partial warning for gap")
+	}
+	joined := strings.Join(warn.Missing, ",")
+	if !strings.Contains(joined, "part2") {
+		t.Fatalf("expected part2 in missing: %v", warn.Missing)
 	}
 }
 
@@ -78,18 +92,17 @@ func TestPrepareRarVolumesSpacedName(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// New-naming (partN.rar) with spaces: must resolve to the first part's
+	// original name — rardecode chains natively and the space is fine.
 	write("@ft7logs premium 17540.part1.rar")
 	write("@ft7logs premium 17540.part2.rar")
 	write("@ft7logs premium 17540.part3.rar")
-	got, err := prepareRarVolumesForDecode(dir)
+	got, _, err := prepareRarVolumesForDecode(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Base(got) != "__rarjoin.rar" {
-		t.Fatalf("got %q", got)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "__rarjoin.r00")); err != nil {
-		t.Fatalf("missing join r00: %v", err)
+	if filepath.Base(got) != "@ft7logs premium 17540.part1.rar" {
+		t.Fatalf("spaced new-naming should pass through first part, got %q", got)
 	}
 }
 

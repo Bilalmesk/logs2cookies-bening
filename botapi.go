@@ -46,8 +46,17 @@ func sendOpts() *telegram.SendOptions {
 	return &telegram.SendOptions{ParseMode: "markdown"}
 }
 
+func sendOptsHTML() *telegram.SendOptions {
+	return &telegram.SendOptions{ParseMode: "HTML"}
+}
+
 func (b *Bot) SendText(chatID int64, text string) (*telegram.NewMessage, error) {
 	return b.client.SendMessage(chatID, text, sendOpts())
+}
+
+// SendHTML sends a status-style HTML message (progress cards).
+func (b *Bot) SendHTML(chatID int64, text string) (*telegram.NewMessage, error) {
+	return b.client.SendMessage(chatID, text, sendOptsHTML())
 }
 
 func (b *Bot) SendTextWithKeyboard(chatID int64, text string, kb telegram.ReplyMarkup) (*telegram.NewMessage, error) {
@@ -65,12 +74,31 @@ func (b *Bot) EditStatus(s SentMsg, text string) {
 	}
 }
 
+// EditStatusHTML updates a progress card without markdown underscore breakage.
+func (b *Bot) EditStatusHTML(s SentMsg, text string) {
+	if !s.valid() {
+		return
+	}
+	if _, err := b.client.EditMessage(s.ChatID, s.MsgID, text, sendOptsHTML()); err != nil {
+		log.Printf("edit status html chat=%d: %v", s.ChatID, err)
+	}
+}
+
 func (b *Bot) EditTextWithKeyboard(chatID int64, msgID int, text string, kb telegram.ReplyMarkup) {
 	opt := sendOpts()
 	opt.ReplyMarkup = kb
 	if _, err := b.client.EditMessage(chatID, int32(msgID), text, opt); err != nil {
 		log.Printf("edit keyboard chat=%d: %v", chatID, err)
 	}
+}
+
+// EditStatusWithKeyboard edits a status message (SentMsg) and attaches an
+// inline keyboard — used to surface retry/dismiss buttons on a failed step.
+func (b *Bot) EditStatusWithKeyboard(s SentMsg, text string, kb telegram.ReplyMarkup) {
+	if !s.valid() {
+		return
+	}
+	b.EditTextWithKeyboard(s.ChatID, int(s.MsgID), text, kb)
 }
 
 func (b *Bot) EditPlain(chatID int64, msgID int, text string) {
@@ -173,6 +201,35 @@ func commandName(m *telegram.NewMessage) string {
 	return strings.ToLower(cmd)
 }
 
+// loadDotEnv loads KEY=VAL pairs from path into the process env without
+// overriding values already set. Missing file is a no-op.
+func loadDotEnv(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		i := strings.IndexByte(line, '=')
+		if i <= 0 {
+			continue
+		}
+		k := strings.TrimSpace(line[:i])
+		v := strings.TrimSpace(line[i+1:])
+		if len(v) >= 2 {
+			if (v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'') {
+				v = v[1 : len(v)-1]
+			}
+		}
+		if os.Getenv(k) == "" {
+			os.Setenv(k, v)
+		}
+	}
+}
+
 func telegramEnv() (apiID int, apiHash, token string, err error) {
 	if v := strings.TrimSpace(os.Getenv("TELEGRAM_API_ID")); v != "" {
 		apiID, _ = strconv.Atoi(v)
@@ -201,12 +258,16 @@ func telegramEnv() (apiID int, apiHash, token string, err error) {
 		missing = append(missing, "TELEGRAM_BOT_TOKEN")
 	}
 	if len(missing) > 0 {
-		err = fmt.Errorf("missing env: %v (get API ID/hash from https://my.telegram.org/apps)", missing)
+		err = fmt.Errorf("missing env: %v — set in .env or export (API ID/hash: https://my.telegram.org/apps, token: @BotFather)", missing)
 	}
 	return
 }
 
 func runTelegramBot(root string) error {
+	// Prefer local .env, then parent copies.
+	loadDotEnv(".env")
+	loadDotEnv(filepath.Join(root, ".env"))
+
 	apiID, apiHash, token, err := telegramEnv()
 	if err != nil {
 		return err

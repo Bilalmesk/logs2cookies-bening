@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +56,8 @@ type Stats struct {
 	UniqueCookies int
 	DomainCounts  map[string]int
 	BrowserHints  map[string]int
+	// Partial is set when multi-volume extract ran with missing parts.
+	Partial *PartialExtractWarning
 }
 
 func workRoot() string {
@@ -69,9 +72,18 @@ func main() {
 	// 8 GiB cgroup OOM-kills us. Cheap insurance.
 	debug.SetMemoryLimit(7 << 30)
 
-	if len(os.Args) > 1 && os.Args[1] == "download" {
-		runCLIDownload(os.Args[2:])
-		return
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "download":
+			runCLIDownload(os.Args[2:])
+			return
+		case "extract":
+			runCLIExtract(os.Args[2:])
+			return
+		case "presets", "list-presets":
+			runCLIExtract([]string{"--list-presets"})
+			return
+		}
 	}
 	root := workRoot()
 	if err := runTelegramBot(root); err != nil {
@@ -104,6 +116,8 @@ func handle(bot *Bot, m *telegram.NewMessage) {
 			} else {
 				reply(bot, m, "no multi-part upload in progress — send archive parts first")
 			}
+		case "preset":
+			handlePresetCommand(bot, m)
 		}
 		return
 	}
@@ -123,6 +137,12 @@ func handle(bot *Bot, m *telegram.NewMessage) {
 			return
 		case StateAwaitingCustom:
 			handleCustomReply(bot, m, s)
+			return
+		case StateAwaitingPresetSave:
+			handlePresetSaveNameReply(bot, m, s)
+			return
+		case StateAwaitingPresetCreate:
+			handlePresetCreateReply(bot, m, s)
 			return
 		}
 	}
@@ -184,16 +204,174 @@ func runCLIDownload(args []string) {
 		formatBytes(res.Bytes), res.Duration.Round(time.Millisecond), mbps, res.Parallel, res.RangeUsed, res.ContentType)
 }
 
+// parseCaptionMeta pulls intentional domain filter + archive password from a
+// Telegram caption. Stealer packs often caption passwords like:
+//
+//	✅ Password @HUNTER_CLOUDS
+//	pass: secret123
+//
+// Old behaviour treated the ENTIRE caption as a domain filter — so every cookie
+// was dropped with "none matched ✅ Password @…". Only real filters stick now.
+func parseCaptionMeta(caption string) (filter, password string) {
+	caption = strings.TrimSpace(caption)
+	if caption == "" {
+		return "", ""
+	}
+	password = extractCaptionPassword(caption)
+	filter = parseFilter(caption)
+	return filter, password
+}
+
 func parseFilter(caption string) string {
 	caption = strings.TrimSpace(caption)
 	if caption == "" {
 		return ""
 	}
 	low := strings.ToLower(caption)
+
+	// Explicit: filter:netflix  or  filter: steam epic
 	if strings.HasPrefix(low, "filter:") {
-		return strings.TrimSpace(caption[len("filter:"):])
+		return cleanFilterToken(strings.TrimSpace(caption[len("filter:"):]))
 	}
-	return caption
+
+	// Whole caption is a password line → not a filter
+	if looksLikePasswordCaption(caption) {
+		return ""
+	}
+
+	// Only accept short domain-like tokens (no spaces/emoji/@/password noise).
+	// Multi-word free text is almost never a filter; user can type domains later.
+	if strings.ContainsAny(caption, " \t\n@#✅🔒🔑") {
+		// allow "filter-like" multi domain only if every token is domain-ish
+		parts := strings.FieldsFunc(caption, func(r rune) bool {
+			return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
+		})
+		var good []string
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if isDomainFilterToken(p) {
+				good = append(good, strings.ToLower(strings.TrimPrefix(p, ".")))
+			}
+		}
+		if len(good) == 0 {
+			return ""
+		}
+		// only if ALL tokens were domain-like (no junk mixed in)
+		if len(good) == len(parts) {
+			return strings.Join(good, " ")
+		}
+		return ""
+	}
+
+	if isDomainFilterToken(caption) {
+		return cleanFilterToken(caption)
+	}
+	return ""
+}
+
+func cleanFilterToken(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, ".")
+	return s
+}
+
+func isDomainFilterToken(s string) bool {
+	s = strings.TrimSpace(strings.ToLower(s))
+	s = strings.TrimPrefix(s, ".")
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	// password / UI junk
+	for _, bad := range []string{"password", "pass", "passwd", "pwd", "pw", "hunter", "cloud"} {
+		if s == bad {
+			return false
+		}
+	}
+	if strings.Contains(s, "password") || strings.Contains(s, "passwd") {
+		return false
+	}
+	// must look like a hostname fragment: letters/digits/dots/hyphens only
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_' {
+			continue
+		}
+		return false
+	}
+	// single pure number is not a domain
+	if _, err := strconv.Atoi(s); err == nil {
+		return false
+	}
+	return true
+}
+
+func looksLikePasswordCaption(caption string) bool {
+	low := strings.ToLower(caption)
+	// strip emoji / noise for matching
+	compact := strings.Map(func(r rune) rune {
+		if r < 128 {
+			return r
+		}
+		return ' '
+	}, low)
+	compact = strings.Join(strings.Fields(compact), " ")
+	if strings.Contains(compact, "password") || strings.Contains(compact, "passwd") {
+		return true
+	}
+	if strings.HasPrefix(compact, "pass ") || strings.HasPrefix(compact, "pass:") ||
+		strings.HasPrefix(compact, "pw:") || strings.HasPrefix(compact, "pwd:") ||
+		strings.HasPrefix(compact, "pw ") || strings.HasPrefix(compact, "pwd ") {
+		return true
+	}
+	return false
+}
+
+// extractCaptionPassword finds archive passwords in common stealer captions.
+//
+//	Password @HUNTER_CLOUDS
+//	✅ Password: secret
+//	pass: foo
+//	pw=bar
+func extractCaptionPassword(caption string) string {
+	caption = strings.TrimSpace(caption)
+	if caption == "" {
+		return ""
+	}
+	// Normalize fancy spaces / zero-width
+	caption = strings.Map(func(r rune) rune {
+		switch r {
+		case '\u00a0', '\u200b', '\u200c', '\u200d', '\ufeff':
+			return ' '
+		default:
+			return r
+		}
+	}, caption)
+
+	patterns := []*regexp.Regexp{
+		// Password @HUNTER_CLOUDS  /  Password: HUNTER  /  pw=xxx  /  pwd: xxx
+		regexp.MustCompile(`(?i)(?:pass(?:word|wd)?|pwd|pw)\s*[@:=\-–—]\s*([^\s#|]+)`),
+		// pass HUNTER_CLOUDS (space-separated)
+		regexp.MustCompile(`(?i)(?:^|[\s|])(?:pass(?:word|wd)?|pwd|pw)\s+([A-Za-z0-9_@.\-]{3,})`),
+		// 🔑 secret  /  🔒 secret
+		regexp.MustCompile(`(?:🔑|🔒|🔐)\s*([A-Za-z0-9_@.\-]{3,})`),
+	}
+	for _, re := range patterns {
+		if m := re.FindStringSubmatch(caption); len(m) == 2 {
+			pw := strings.TrimSpace(m[1])
+			pw = strings.TrimPrefix(pw, "@")
+			pw = strings.Trim(pw, "\"'`")
+			if pw == "" || len(pw) < 3 {
+				continue
+			}
+			if strings.EqualFold(pw, "password") || strings.EqualFold(pw, "pass") {
+				continue
+			}
+			return pw
+		}
+	}
+	return ""
 }
 
 func filterTag(f string) string {
@@ -212,8 +390,25 @@ func looksLikeCookieFile(fullPath string) bool {
 		base = p[i+1:]
 	}
 
+	// Chrome/Edge Cookies DB (often extensionless or .db/.sqlite)
+	if base == "cookies" || base == "cookies.db" || base == "cookies.sqlite" {
+		return true
+	}
+	if strings.HasSuffix(base, ".sqlite") || strings.HasSuffix(base, ".db") {
+		for _, h := range COOKIE_NAME_HINTS {
+			if strings.Contains(base, h) {
+				return true
+			}
+		}
+		// profile path: .../Network/Cookies or .../Cookies
+		if strings.Contains(p, "/network/cookies") || strings.HasSuffix(p, "/cookies") {
+			return true
+		}
+	}
+
 	// No extension: only match if the filename is exactly "cookies".
-	if !strings.HasSuffix(p, ".txt") && !strings.HasSuffix(p, ".json") && !strings.HasSuffix(p, ".dat") {
+	if !strings.HasSuffix(p, ".txt") && !strings.HasSuffix(p, ".json") && !strings.HasSuffix(p, ".dat") &&
+		!strings.HasSuffix(p, ".sqlite") && !strings.HasSuffix(p, ".db") {
 		return base == "cookies"
 	}
 
@@ -227,7 +422,7 @@ func looksLikeCookieFile(fullPath string) bool {
 	// .txt/.json/.dat file whose name (without extension) is a browser name
 	// → likely a cookie dump named after the browser (chrome.txt, firefox.json…).
 	stem := base
-	for _, ext := range []string{".txt", ".json", ".dat"} {
+	for _, ext := range []string{".txt", ".json", ".dat", ".sqlite", ".db"} {
 		stem = strings.TrimSuffix(stem, ext)
 	}
 	for _, b := range browserNames {
@@ -251,6 +446,16 @@ func detectBrowser(path string) string {
 }
 
 func parseCookieFile(name string, data []byte) []CookieRow {
+	if isSQLiteHeader(data) {
+		return parseSQLiteCookies(name, data)
+	}
+	// extension hint for mis-detected empty sqlite
+	ln := strings.ToLower(name)
+	if strings.HasSuffix(ln, ".sqlite") || strings.HasSuffix(ln, ".db") {
+		if rows := parseSQLiteCookies(name, data); len(rows) > 0 {
+			return rows
+		}
+	}
 	i := 0
 	for i < len(data) && (data[i] == ' ' || data[i] == '\t' || data[i] == '\n' || data[i] == '\r') {
 		i++
@@ -548,29 +753,34 @@ func summary(s Stats, filter, archive string) string {
 }
 
 func helpText() string {
+	builtins := strings.Join(listBuiltinPresetNames(), " · ")
 	return strings.Join([]string{
 		"🍪 *logs2cookies*",
-		"extracts per-victim cookie files from stealer log archives.",
+		"extract cookies from stealer-log archives.",
 		"",
-		"*step 1 — send the archive*",
-		"  📎 attach a .zip or .rar (split rar? send all parts, then `/done`)",
-		"  📎 multi-part rar: `.rar` + `.part2.rar` / `.r00` … then `/done`",
-		"  🔗 or paste a direct URL / simple redirect to a .zip or .rar (up to `5 GB`)",
-		"  🪆 nested archives unpacked automatically (up to 4 levels)",
-		"  🔒 encrypted? the bot will ask for the password",
+		"*send me*",
+		"  📎 a `.zip` / `.rar` file (up to `2 GB`)",
+		"  📎 split archive? send parts then `/done` — *incomplete sets still extract*",
+		"  🔗 or paste a direct URL to a `.zip`/`.rar` (up to `5 GB`)",
 		"",
-		"*step 2 — pick what to extract*",
-		"  • type domains: `netflix paypal steam`",
-		"  • tap *extract all* or *top 50* for quick grabs",
-		"  • tap *browse domains* to toggle domains one by one",
+		"*then pick what you want*",
+		"  • tap *extract all*, *top 50*, or *browse domains*",
+		"  • tap a *builtin pack* (cursor · github · steam…)",
+		"  • tap *⭐ presets* to save/reuse domain sets",
+		"  • or just type domains: `netflix paypal steam`",
 		"",
-		"*tip — pre-filter (optional)*",
-		"  add `filter:netflix` as the file caption to skip unrelated cookies during extraction",
+		"*builtin packs*",
+		"  " + builtins,
 		"",
-		"*output*",
-		"  one Netscape .txt per victim, inside a .zip per domain",
+		"*tips*",
+		"  🔒 encrypted? i'll ask for the password",
+		"  🪆 nested archives unpacked automatically",
+		"  🏷 caption `filter:netflix` to pre-filter during extraction",
+		"  🧹 expired + empty values dropped automatically",
+		"  💾 Chrome/Firefox SQLite cookie DBs parsed too",
+		"  ⭐ `/preset save gaming steam epicgames` — reuse across archives",
 		"",
-		"  /cancel — abort current session",
+		"`/cancel` — abort  ·  `/done` — finish multi-part rar  ·  `/preset` — manage presets",
 	}, "\n")
 }
 
@@ -582,6 +792,11 @@ func reply(bot *Bot, m *telegram.NewMessage, text string) {
 
 func editStatus(bot *Bot, s SentMsg, text string) {
 	bot.EditStatus(s, text)
+}
+
+// editStatusCard uses HTML progress cards (safe for _ ! @ in filenames).
+func editStatusCard(bot *Bot, s SentMsg, text string) {
+	bot.EditStatusHTML(s, text)
 }
 
 type progressFn func(done, total int64, bps float64)

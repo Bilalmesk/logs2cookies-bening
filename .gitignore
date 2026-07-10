@@ -1,20 +1,22 @@
-# binaries (built in CI or locally)
-logs2cookies
-logs2cookies-linux
-logs2cookies.exe
-*.exe
 
-# runtime
-work/
+__7zout/
+# binaries
+cache_*.db
 D:/botdata/
-*.spool
 download.bin
-
-# secrets
 .env
 .env.*
 !.env.example
-
+*.exe
 # go
+logs2cookies
+logs2cookies.exe
+logs2cookies-linux
+# runtime
+# secrets
+*.session
+*.spool
+third_party/
 /vendor/
-combobot-src-final.zip
+work/
+__zipjoin*

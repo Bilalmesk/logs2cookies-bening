@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCleanSourceName(t *testing.T) {
@@ -231,4 +232,89 @@ func TestSpoolScrubsBadChars(t *testing.T) {
 	if strings.Count(string(data), "\n") != 1 {
 		t.Errorf("expected exactly 1 newline (record terminator), got: %q", string(data))
 	}
+}
+
+// Regression: progress counters must be per-spool, not shared globals.
+// Two concurrent spools must each observe only their own (entries, cookies),
+// proving the heartbeat no longer cross-contaminates rates between sessions.
+func TestSpoolProgressIsolation(t *testing.T) {
+	t.Parallel()
+
+	dir1 := t.TempDir()
+	sp1, err := NewSpool(filepath.Join(dir1, "s1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir2 := t.TempDir()
+	sp2, err := NewSpool(filepath.Join(dir2, "s2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// sp1: 3 entries, 2 unique cookies.
+	sp1.OnEntry()
+	sp1.OnEntry()
+	sp1.OnEntry()
+	sp1.Add(CookieRow{Domain: ".a.com", Path: "/", Name: "n", Value: "1", Source: "A/cookies.txt"})
+	sp1.Add(CookieRow{Domain: ".b.com", Path: "/", Name: "n", Value: "1", Source: "A/cookies.txt"})
+
+	// sp2: 1 entry, 1 unique cookie. Must NOT include sp1's counts.
+	sp2.OnEntry()
+	sp2.Add(CookieRow{Domain: ".c.com", Path: "/", Name: "n", Value: "1", Source: "C/cookies.txt"})
+
+	e1, c1 := sp1.Progress()
+	if e1 != 3 {
+		t.Errorf("sp1 entries: got %d want 3", e1)
+	}
+	if c1 != 2 {
+		t.Errorf("sp1 cookies: got %d want 2", c1)
+	}
+
+	e2, c2 := sp2.Progress()
+	if e2 != 1 {
+		t.Errorf("sp2 entries: got %d want 1 (isolation broke — saw sp1's counts?)", e2)
+	}
+	if c2 != 1 {
+		t.Errorf("sp2 cookies: got %d want 1 (isolation broke — saw sp1's counts?)", c2)
+	}
+
+	sp1.Close()
+	sp2.Close()
+}
+
+// Regression: the extract queue must report how many sessions are waiting,
+// not just block silently. This is the observable behaviour the heartbeat
+// relies on to say "queued behind N job(s)".
+func TestExtractSemaphoreQueueLen(t *testing.T) {
+	q := newExtractSemaphore(2)
+
+	// Fill both slots.
+	q.acquire()
+	q.acquire()
+	if got := q.queueLen(); got != 0 {
+		t.Errorf("after filling slots, queueLen = %d want 0", got)
+	}
+
+	// Third acquire must queue. Launch it in a goroutine and give it time to
+	// register in the queue before we observe.
+	done := make(chan struct{})
+	go func() {
+		q.acquire()
+		close(done)
+	}()
+	// Allow the goroutine to reach the queue counter increment.
+	time.Sleep(50 * time.Millisecond)
+	if got := q.queueLen(); got != 1 {
+		t.Errorf("queued acquirer not counted: queueLen = %d want 1", got)
+	}
+
+	// Releasing a slot must let the queued acquirer through and drop the count.
+	q.release()
+	<-done
+	if got := q.queueLen(); got != 0 {
+		t.Errorf("after drain, queueLen = %d want 0", got)
+	}
+
+	// Drain remaining slot so we don't leak.
+	q.release()
 }

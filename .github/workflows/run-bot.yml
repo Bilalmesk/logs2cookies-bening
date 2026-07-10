@@ -51,7 +51,7 @@ jobs:
 
       - name: Check formatting
         run: |
-          unformatted=$(gofmt -l .)
+          unformatted=$(gofmt -l $(find . -name '*.go' -not -path './third_party/*' -not -path './.git/*'))
           if [ -n "$unformatted" ]; then
             echo "gofmt needed on:"
             echo "$unformatted"
@@ -68,7 +68,7 @@ jobs:
         run: go build -ldflags="-s -w" -o logs2cookies .
 
   deploy:
-    # Windows runner: large temp storage lives on D: (not the small C: OS disk)
+    # Windows runner: large temp storage on D: (not the small C: OS disk)
     needs: checks
     if: github.event.inputs.confirm_deploy == 'yes — deploy bot after checks'
     runs-on: windows-latest
@@ -91,13 +91,32 @@ jobs:
           New-Item -ItemType Directory -Force -Path 'D:\botdata' | Out-Null
           Write-Host 'Bot work dir: D:\botdata\work'
 
+      # Optional multi-volume RAR/ZIP recovery (bot falls back to 7z when pure-Go fails)
+      - name: Ensure 7-Zip on PATH
+        shell: pwsh
+        run: |
+          $seven = @(
+            'C:\Program Files\7-Zip\7z.exe',
+            'C:\Program Files (x86)\7-Zip\7z.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($seven) {
+            $dir = Split-Path $seven
+            echo "$dir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            Write-Host "7-Zip found: $seven"
+            & $seven | Select-Object -First 2
+          } else {
+            Write-Host "7-Zip not preinstalled — multi-part mid-volume recovery may be limited"
+          }
+
       - name: Build
         run: go build -ldflags="-s -w" -o logs2cookies.exe .
 
       - name: Run bot
         shell: pwsh
         env:
+          # botapi.go accepts BOT_TOKEN or TELEGRAM_BOT_TOKEN
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           WORK_ROOT: D:/botdata/work

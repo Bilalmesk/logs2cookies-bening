@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -21,13 +22,20 @@ const (
 // Spool streams parsed cookies to a single on-disk file during extraction.
 // Only stats + a dedupe set live in RAM, so a 5GB archive with millions of
 // cookies costs ~MB of RAM instead of ~GB.
+//
+// entries/cookies are per-spool progress counters (atomic) so a heartbeat
+// reader can observe extraction progress for THIS session without being
+// polluted by other sessions extracting concurrently (the previous
+// implementation used package globals, which cross-contaminated rates).
 type Spool struct {
-	mu    sync.Mutex
-	path  string
-	f     *os.File
-	w     *bufio.Writer
-	seen  map[string]struct{}
-	stats Stats
+	mu      sync.Mutex
+	path    string
+	f       *os.File
+	w       *bufio.Writer
+	seen    map[string]struct{}
+	stats   Stats
+	entries int64 // atomic — entries scanned so far
+	cookies int64 // atomic — unique cookies written so far
 }
 
 func NewSpool(path string) (*Spool, error) {
@@ -47,12 +55,18 @@ func NewSpool(path string) (*Spool, error) {
 	}, nil
 }
 
+// Progress returns this spool's own (entries, cookies) counters.
+func (s *Spool) Progress() (entries, cookies int64) {
+	return atomic.LoadInt64(&s.entries), atomic.LoadInt64(&s.cookies)
+}
+
 func (s *Spool) Path() string { return s.path }
 
 func (s *Spool) OnEntry() {
 	s.mu.Lock()
 	s.stats.ArchiveFiles++
 	s.mu.Unlock()
+	atomic.AddInt64(&s.entries, 1)
 }
 
 func (s *Spool) OnCookieFile(sourceName string) {
@@ -65,7 +79,32 @@ func (s *Spool) OnCookieFile(sourceName string) {
 // Add appends a cookie. Returns true if it was new (not a dup).
 // Stats counts mirror the original (pre-dedupe) extractor's behavior:
 // TotalCookies counts every call, DomainCounts also counts every call.
+// Quality gates (empty/expired), CLI name/domain filters applied here.
 func (s *Spool) Add(r CookieRow) bool {
+	// Normalize Chrome-style timestamps early so Netscape output is usable.
+	r.Expiration = normalizeExpirationField(r.Expiration)
+
+	// Default quality filters (CLI can opt out).
+	if !cliKeepEmpty && isEmptyCookieValue(r.Value) {
+		return false
+	}
+	if !cliKeepExpired && isExpiredCookie(r.Expiration, nowUnix()) {
+		return false
+	}
+	if strings.TrimSpace(r.Name) == "" || strings.TrimSpace(r.Domain) == "" {
+		return false
+	}
+	// Offline CLI name filter
+	if len(cliNameFilter) > 0 && !cookieNameMatches(r.Name, cliNameFilter) {
+		return false
+	}
+	// Offline CLI domain filter (subdomain-aware)
+	if cliStrictDomains && len(cliDomainFilter) > 0 {
+		if !rowMatchesAnyDomain(r, cliDomainFilter) {
+			return false
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -80,6 +119,7 @@ func (s *Spool) Add(r CookieRow) bool {
 	}
 	s.seen[key] = struct{}{}
 	s.stats.UniqueCookies++
+	atomic.AddInt64(&s.cookies, 1)
 
 	w := s.w
 	w.WriteString(scrubField(r.Domain))
@@ -120,6 +160,7 @@ func (s *Spool) Stats() Stats {
 		UniqueCookies: s.stats.UniqueCookies,
 		DomainCounts:  dc,
 		BrowserHints:  bh,
+		Partial:       s.stats.Partial,
 	}
 }
 
@@ -128,6 +169,16 @@ func (s *Spool) Stats() Stats {
 func (s *Spool) FreeSeen() {
 	s.mu.Lock()
 	s.seen = nil
+	s.mu.Unlock()
+}
+
+// SetPartial records a multi-volume partial-extract warning on the spool stats.
+func (s *Spool) SetPartial(w *PartialExtractWarning) {
+	if w == nil {
+		return
+	}
+	s.mu.Lock()
+	s.stats.Partial = w
 	s.mu.Unlock()
 }
 
@@ -333,4 +384,147 @@ func normalDomainBytes(b []byte) string {
 		b = b[1:]
 	}
 	return strings.ToLower(string(b))
+}
+
+// streamFilterToZipNamed is streamFilterToZip with an optional cookie-name allowlist
+// (case-insensitive exact match). Empty names = no name filter.
+func streamFilterToZipNamed(spoolPath, zipPath string, selected map[string]bool, custom, names []string) (int, int, error) {
+	if len(names) == 0 {
+		return streamFilterToZip(spoolPath, zipPath, selected, custom)
+	}
+	nameSet := map[string]bool{}
+	for _, n := range names {
+		nameSet[strings.ToLower(strings.TrimSpace(n))] = true
+	}
+
+	sf, err := os.Open(spoolPath)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer sf.Close()
+
+	workDir := filepath.Dir(zipPath)
+	type sink struct {
+		f      *os.File
+		bw     *bufio.Writer
+		source string
+		rows   int
+	}
+	sinks := map[string]*sink{}
+	cleanupTemps := func() {
+		for _, sk := range sinks {
+			sk.bw.Flush()
+			sk.f.Close()
+			os.Remove(sk.f.Name())
+		}
+	}
+
+	sc := bufio.NewScanner(sf)
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	totalRows := 0
+
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		parts := bytes.SplitN(line, []byte{SPOOL_FS}, 8)
+		if len(parts) < 8 {
+			continue
+		}
+		dom := normalDomainBytes(parts[0])
+		match := selected[dom]
+		if !match {
+			for _, sub := range custom {
+				if strings.Contains(dom, sub) {
+					match = true
+					break
+				}
+			}
+		}
+		if !match {
+			continue
+		}
+		cname := strings.ToLower(string(parts[5]))
+		if !nameSet[cname] {
+			continue
+		}
+
+		source := string(parts[7])
+		key := cleanSourceName(source)
+		sk, ok := sinks[key]
+		if !ok {
+			tmpf, terr := os.CreateTemp(workDir, "src-*.txt")
+			if terr != nil {
+				cleanupTemps()
+				return 0, totalRows, terr
+			}
+			bw := bufio.NewWriterSize(tmpf, 32*1024)
+			fmt.Fprintln(bw, "# Netscape HTTP Cookie File")
+			fmt.Fprintln(bw, "# Generated by logs2cookies-bot")
+			fmt.Fprintf(bw, "# Source: %s\n\n", source)
+			sk = &sink{f: tmpf, bw: bw, source: source}
+			sinks[key] = sk
+		}
+		fmt.Fprintf(sk.bw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			string(parts[0]),
+			defaultStr(string(parts[1]), "TRUE"),
+			defaultStr(string(parts[2]), "/"),
+			defaultStr(string(parts[3]), "FALSE"),
+			defaultStr(string(parts[4]), "0"),
+			string(parts[5]),
+			string(parts[6]),
+		)
+		sk.rows++
+		totalRows++
+	}
+	if scErr := sc.Err(); scErr != nil {
+		cleanupTemps()
+		return 0, totalRows, scErr
+	}
+
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		cleanupTemps()
+		return 0, totalRows, err
+	}
+	defer zf.Close()
+	zw := zip.NewWriter(zf)
+
+	keys := make([]string, 0, len(sinks))
+	for k := range sinks {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		sk := sinks[key]
+		if err := sk.bw.Flush(); err != nil {
+			cleanupTemps()
+			zw.Close()
+			return 0, totalRows, err
+		}
+		if _, err := sk.f.Seek(0, 0); err != nil {
+			cleanupTemps()
+			zw.Close()
+			return 0, totalRows, err
+		}
+		ew, werr := zw.Create(key + ".txt")
+		if werr != nil {
+			cleanupTemps()
+			zw.Close()
+			return 0, totalRows, werr
+		}
+		if _, err := io.Copy(ew, sk.f); err != nil {
+			cleanupTemps()
+			zw.Close()
+			return 0, totalRows, err
+		}
+	}
+	if err := zw.Close(); err != nil {
+		cleanupTemps()
+		return 0, totalRows, err
+	}
+	cleanupTemps()
+	return len(sinks), totalRows, nil
 }

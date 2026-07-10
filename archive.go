@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 
 	"github.com/nwaples/rardecode/v2"
 	zipx "github.com/yeka/zip"
@@ -41,20 +40,6 @@ var ErrPasswordRequired = errors.New("password required")
 var ErrBadPassword = errors.New("bad password")
 
 const MAX_NEST_DEPTH = 4
-
-var (
-	extractEntries int64
-	extractCookies int64
-)
-
-func ResetExtractProgress() {
-	atomic.StoreInt64(&extractEntries, 0)
-	atomic.StoreInt64(&extractCookies, 0)
-}
-
-func ExtractProgress() (entries, cookies int64) {
-	return atomic.LoadInt64(&extractEntries), atomic.LoadInt64(&extractCookies)
-}
 
 // processArchiveSpool is the streaming entry point — every cookie row is
 // pushed to the spool (disk) instead of accumulated in a slice.
@@ -92,6 +77,13 @@ func spawnNestedSpool(reader io.Reader, name string, filter, password string, de
 func processZipSpool(zipPath, filter, password string, depth int, spool *Spool) error {
 	zr, err := zipx.OpenReader(zipPath)
 	if err != nil {
+		// Corrupt/incomplete multi-part zip → 7z best-effort
+		if ferr := try7zBestEffort(zipPath, filter, spool); ferr == nil {
+			spool.SetPartial(&PartialExtractWarning{
+				Note: "zip open failed in pure-Go; recovered via 7z best-effort",
+			})
+			return nil
+		}
 		return err
 	}
 	defer zr.Close()
@@ -108,10 +100,11 @@ func processZipSpool(zipPath, filter, password string, depth int, spool *Spool) 
 	}
 
 	flow := strings.ToLower(filter)
+	pwFails := 0
+	gotCookieData := false
 
 	for _, zf := range zr.File {
 		spool.OnEntry()
-		atomic.AddInt64(&extractEntries, 1)
 		if zf.FileInfo().IsDir() {
 			continue
 		}
@@ -126,6 +119,9 @@ func processZipSpool(zipPath, filter, password string, depth int, spool *Spool) 
 			}
 			rc, oerr := zf.Open()
 			if oerr != nil {
+				if password != "" && isPasswordErr(oerr) {
+					pwFails++
+				}
 				continue
 			}
 			_ = spawnNestedSpool(rc, name, filter, password, depth, spool)
@@ -150,10 +146,10 @@ func processZipSpool(zipPath, filter, password string, depth int, spool *Spool) 
 		f, err := zf.Open()
 		if err != nil {
 			if isPasswordErr(err) {
-				if password == "" {
-					continue
+				if password != "" {
+					pwFails++
 				}
-				return ErrBadPassword
+				continue // try other files; unencrypted cookies may still work
 			}
 			continue
 		}
@@ -161,7 +157,10 @@ func processZipSpool(zipPath, filter, password string, depth int, spool *Spool) 
 		f.Close()
 		if rerr != nil {
 			if isPasswordErr(rerr) {
-				return ErrBadPassword
+				if password != "" {
+					pwFails++
+				}
+				continue
 			}
 			continue
 		}
@@ -171,26 +170,50 @@ func processZipSpool(zipPath, filter, password string, depth int, spool *Spool) 
 		if len(parsed) == 0 {
 			continue
 		}
+		gotCookieData = true
 		spool.OnCookieFile(name)
 
 		for _, r := range parsed {
-			if flow != "" && !strings.Contains(strings.ToLower(r.Domain), flow) {
+			if flow != "" && !domainFilterMatch(r.Domain, flow) {
 				continue
 			}
-			if spool.Add(r) {
-				atomic.AddInt64(&extractCookies, 1)
-			}
+			spool.Add(r)
 		}
+	}
+	// Only report wrong password if we tried one, hits failed decrypt, and got nothing usable.
+	if password != "" && pwFails > 0 && !gotCookieData && !spoolHasCookies(spool) {
+		return ErrBadPassword
 	}
 	return nil
 }
 
+// domainFilterMatch: if filter looks like a hostname (contains a dot), use
+// subdomain-aware matching; otherwise keep loose substring (e.g. "steam").
+func domainFilterMatch(cookieDomain, filter string) bool {
+	filter = strings.ToLower(strings.TrimSpace(filter))
+	if filter == "" {
+		return true
+	}
+	if strings.Contains(filter, ".") {
+		return domainMatchesTarget(cookieDomain, filter)
+	}
+	return domainContainsLoose(cookieDomain, filter)
+}
+
 func processRarSpool(rarPath, filter, password string, depth int, spool *Spool) error {
+	// Caller (runArchiveExtraction) has already resolved multi-volume sets to
+	// a single openable path. We only re-resolve for nested RARs (spawned via
+	// spawnNestedSpool) whose sibling volumes live in the same temp dir and
+	// haven't been prepared yet.
 	openPath := rarPath
-	if resolved, err := resolveRarOpenPath(filepath.Dir(rarPath)); err == nil {
-		openPath = resolved
-	} else if errors.Is(err, ErrRarPartsMissing) {
-		return err
+	var partial *PartialExtractWarning
+	if needsRarResolve(rarPath) {
+		resolved, warn, err := resolveRarOpenPath(filepath.Dir(rarPath))
+		if err == nil {
+			openPath = resolved
+			partial = warn
+		}
+		// incomplete sets no longer hard-fail here — try openPath as-is
 	}
 
 	opts := []rardecode.Option{}
@@ -205,11 +228,36 @@ func processRarSpool(rarPath, filter, password string, depth int, spool *Spool) 
 			}
 			return ErrBadPassword
 		}
+		// Mid-volume only / broken chain → try 7z best-effort, then soft-fail.
+		if isVolumeErr(err) {
+			if ferr := try7zBestEffort(openPath, filter, spool); ferr == nil {
+				spool.SetPartial(mergePartial(partial, &PartialExtractWarning{
+					Note: "opened mid-volume set via 7z best-effort",
+				}))
+				return nil
+			}
+			// Last resort: try every sibling volume path with 7z
+			if ferr := try7zBestEffort(rarPath, filter, spool); ferr == nil {
+				spool.SetPartial(mergePartial(partial, &PartialExtractWarning{
+					Note: "opened via 7z best-effort after rardecode refused the set",
+				}))
+				return nil
+			}
+			// If we already have cookies from a parent nested context, don't wipe them.
+			if spoolHasCookies(spool) {
+				spool.SetPartial(mergePartial(partial, &PartialExtractWarning{
+					Note: "volume open failed mid-set; kept cookies found so far",
+				}))
+				return nil
+			}
+			return fmt.Errorf("%w: %v — send remaining parts or install 7z for mid-part recovery", ErrRarPartsMissing, err)
+		}
 		return err
 	}
 	defer r.Close()
 
 	flow := strings.ToLower(filter)
+	gotAny := false
 
 	for {
 		hdr, err := r.Next()
@@ -223,16 +271,34 @@ func processRarSpool(rarPath, filter, password string, depth int, spool *Spool) 
 				}
 				return ErrBadPassword
 			}
-			if errors.Is(err, rardecode.ErrBadVolumeNumber) {
-				return fmt.Errorf("%w (open the first part, e.g. .part1.rar or the main .rar)", ErrRarPartsMissing)
+			// Missing continuation volume / bad volume mid-stream:
+			// stop cleanly if we already pulled cookies (partial success).
+			if isVolumeErr(err) {
+				if gotAny || spoolHasCookies(spool) {
+					spool.SetPartial(mergePartial(partial, &PartialExtractWarning{
+						Note: "hit missing volume mid-archive — extracted files before the gap",
+					}))
+					return nil
+				}
+				// Nothing yet — try 7z on the open path
+				if ferr := try7zBestEffort(openPath, filter, spool); ferr == nil {
+					spool.SetPartial(mergePartial(partial, &PartialExtractWarning{
+						Note: "rardecode stalled on volumes; recovered via 7z",
+					}))
+					return nil
+				}
+				return fmt.Errorf("%w: %v", ErrRarPartsMissing, err)
 			}
-			if errors.Is(err, fs.ErrNotExist) {
-				return fmt.Errorf("%w (missing a continuation part)", ErrRarPartsMissing)
+			// Other read errors: soft-continue if we have cookies
+			if gotAny || spoolHasCookies(spool) {
+				spool.SetPartial(mergePartial(partial, &PartialExtractWarning{
+					Note: "archive read error mid-stream — partial results kept",
+				}))
+				return nil
 			}
 			return err
 		}
 		spool.OnEntry()
-		atomic.AddInt64(&extractEntries, 1)
 		if hdr.IsDir {
 			continue
 		}
@@ -240,13 +306,12 @@ func processRarSpool(rarPath, filter, password string, depth int, spool *Spool) 
 
 		if isNestedArchive(name) && depth+1 < MAX_NEST_DEPTH {
 			if (hdr.Encrypted || hdr.HeaderEncrypted) && password == "" {
-				continue // skip encrypted nested archive
+				continue
 			}
 			_ = spawnNestedSpool(r, name, filter, password, depth, spool)
 			continue
 		}
 
-		// Only block on encryption for cookie files — skip encrypted non-cookie entries.
 		if (hdr.Encrypted || hdr.HeaderEncrypted) && password == "" {
 			if looksLikeCookieFile(name) {
 				return ErrPasswordRequired
@@ -269,6 +334,7 @@ func processRarSpool(rarPath, filter, password string, depth int, spool *Spool) 
 				}
 				return ErrBadPassword
 			}
+			// truncated file across missing volume — skip this entry
 			continue
 		}
 
@@ -278,17 +344,61 @@ func processRarSpool(rarPath, filter, password string, depth int, spool *Spool) 
 			continue
 		}
 		spool.OnCookieFile(name)
+		gotAny = true
 
 		for _, cr := range parsed {
-			if flow != "" && !strings.Contains(strings.ToLower(cr.Domain), flow) {
+			if flow != "" && !domainFilterMatch(cr.Domain, flow) {
 				continue
 			}
-			if spool.Add(cr) {
-				atomic.AddInt64(&extractCookies, 1)
-			}
+			spool.Add(cr)
 		}
 	}
+	if partial != nil {
+		spool.SetPartial(partial)
+	}
 	return nil
+}
+
+func isVolumeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, rardecode.ErrBadVolumeNumber) || errors.Is(err, fs.ErrNotExist) || errors.Is(err, ErrRarPartsMissing) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "volume") ||
+		strings.Contains(s, "bad volume") ||
+		strings.Contains(s, "unexpected eof") ||
+		strings.Contains(s, "no such file")
+}
+
+func spoolHasCookies(spool *Spool) bool {
+	if spool == nil {
+		return false
+	}
+	st := spool.Stats()
+	return st.UniqueCookies > 0 || st.CookieFiles > 0
+}
+
+func mergePartial(a, b *PartialExtractWarning) *PartialExtractWarning {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	out := *a
+	if b.Note != "" {
+		if out.Note != "" {
+			out.Note = out.Note + "; " + b.Note
+		} else {
+			out.Note = b.Note
+		}
+	}
+	out.Missing = append(append([]string{}, a.Missing...), b.Missing...)
+	out.Have = append(append([]string{}, a.Have...), b.Have...)
+	return &out
 }
 
 func isPasswordErr(err error) bool {
