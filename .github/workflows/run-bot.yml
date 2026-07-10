@@ -28,8 +28,12 @@ concurrency:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Same runner family as deploy (Windows / large disk)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
@@ -65,7 +69,7 @@ jobs:
         run: go test -count=1 -race ./...
 
       - name: Build
-        run: go build -ldflags="-s -w" -o logs2cookies .
+        run: go build -ldflags="-s -w" -o logs2cookies.exe .
 
   deploy:
     # Windows runner: large temp storage on D: (not the small C: OS disk)
@@ -91,7 +95,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path 'D:\botdata' | Out-Null
           Write-Host 'Bot work dir: D:\botdata\work'
 
-      # Optional multi-volume RAR/ZIP recovery (bot falls back to 7z when pure-Go fails)
       - name: Ensure 7-Zip on PATH
         shell: pwsh
         run: |
@@ -114,7 +117,6 @@ jobs:
       - name: Run bot
         shell: pwsh
         env:
-          # botapi.go accepts BOT_TOKEN or TELEGRAM_BOT_TOKEN
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}

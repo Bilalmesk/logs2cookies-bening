@@ -12,8 +12,11 @@ concurrency:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
@@ -35,7 +38,6 @@ jobs:
 
       - name: Check formatting
         run: |
-          # only project sources (skip third_party if present)
           unformatted=$(gofmt -l $(find . -name '*.go' -not -path './third_party/*' -not -path './.git/*'))
           if [ -n "$unformatted" ]; then
             echo "gofmt needed on:"
@@ -50,4 +52,4 @@ jobs:
         run: go test -count=1 -race ./...
 
       - name: Build
-        run: go build -ldflags="-s -w" -o logs2cookies .
+        run: go build -ldflags="-s -w" -o logs2cookies.exe .
